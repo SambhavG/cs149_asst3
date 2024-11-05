@@ -73,11 +73,11 @@ void exclusive_scan(int* input, int N, int* result)
 
     //Going to ignore input and do everything in place on result
     const int threadsPerBlock = 512;
-    const int blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
 
     //upsweep phase
     for (int two_d = 1; two_d <= N/2; two_d*=2) {
         int two_dplus1 = 2*two_d;
+        int blocks = (N/two_dplus1 + threadsPerBlock - 1) / threadsPerBlock;
         //Bulk task launch for the parallel_for
         exclusive_scan_kernel_up<<<blocks, threadsPerBlock>>>(N/two_dplus1, result, two_d, two_dplus1);
         cudaDeviceSynchronize();
@@ -89,6 +89,7 @@ void exclusive_scan(int* input, int N, int* result)
     //downsweep
     for (int two_d = N/2; two_d >= 1; two_d /= 2) {
         int two_dplus1 = 2*two_d;
+        int blocks = (N/two_dplus1 + threadsPerBlock - 1) / threadsPerBlock;
         //Bulk task launch for the parallel_for
         exclusive_scan_kernel_up<<<blocks, threadsPerBlock>>>(N/two_dplus1, result, two_d, two_dplus1);
         cudaDeviceSynchronize();
@@ -188,6 +189,26 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 // indices `i` for which `device_input[i] == device_input[i+1]`.
 //
 // Returns the total number of pairs found
+find_repeat_kernel(int* device_input, int length, int* device_output) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < length) {
+        device_output[index] = (device_input[index] == device_input[index+1]);
+    }
+}
+copy_a_to_b_kernel(int* a, int length, int* b) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < length) {
+        b[index] = a[index];
+    }
+}
+populate_repeat_indices_kernel(int length, int* isRepeat, int* indexToStore, int* result) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < length && input[index]) {
+        result[indexToStore[index+1]] = index;
+    }
+
+}
+
 int find_repeats(int* device_input, int length, int* device_output) {
 
     // CS149 TODO:
@@ -202,6 +223,28 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
 
+    //Create intermediate array
+    int* intermediate = nullptr;
+    cudaMalloc(&intermediate, length);
+
+    //First, set each value to 0 if not duplicate, 1 if so on intermediate
+    const int threadsPerBlock = 512;
+    const int blocks = (length + threadsPerBlock - 1) / threadsPerBlock;
+    find_repeat_kernel<<<blocks, threadsPerBlock>>>(device_input, length, intermediate);
+    cudaDeviceSynchronize();
+
+    //Get prefix sums of intermediate
+    //If it started out as 0 1 1 0 0 0 1 0 1, it will become 0 0 1 2 2 2 2 3 3 4
+    //   0 1 1 0 0 0 1 0 1
+    // 0 0 1 2 2 2 2 3 3 4
+    //First, copy intermediate to input so both are the binary array
+    copy_a_to_b_kernel<<<blocks, threadsPerBlock>>>(intermediate, length, input);
+    cudaDeviceSynchronize();
+    //Next, compute prefix sums on intermediate
+    exclusive_scan(nullptr, length, intermediate);
+    //For each input[i], if it's 1, set output[intermediate[i+1]] to i
+    populate_repeat_indices_kernel(length, device_input, intermediate, device_output);
+    
     return 0; 
 }
 
