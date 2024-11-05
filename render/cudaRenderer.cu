@@ -633,9 +633,21 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
+
+__global__ void
+kernelRecordSpotsOfCircles(int* table, int N) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    //If index < N, record data for circle "index"
+    if (index < N) {
+        //Find all the regions containing this circle
+    }
+}
+
+
 void
 CudaRenderer::render() {
-
+    {
     //The scheme:
     //In setup (or after positions are updated) we construct the following data structure
 
@@ -660,6 +672,21 @@ CudaRenderer::render() {
     //Now go through the large circles and record which regions they're in (can do this in the same parallel loop as small)
     //After region->[small circles] is recorded, can add large circles to these lists and sort
 
+
+    //Let each region be 1/16 x 1/16, so there's 256 regions
+    //Each region is .0625x.0625, so if we let small circles be <.09 in radius, they will be in at most 9 regions
+
+    //First, make an array of arrays. Assume each circle will have at most 9 regions. 
+    //We concatenate the rows together, so the first numCircles elems are the first region containing each circle
+    }
+    int* cudaDeviceRegionTable = nullptr;
+    cudaMalloc(&cudaDeviceRegionTable, sizeof(int) * numCircles * 9);
+
+
+    //Now, do a task launch of the kernel over all circles
+    dim3 blockDim(256, 1);
+    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    kernelRecordSpotsOfCircles<<<gridDim, blockDim>>>(cudaDeviceRegionTable);
 
 
 
