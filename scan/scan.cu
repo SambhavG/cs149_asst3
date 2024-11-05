@@ -42,6 +42,23 @@ static inline int nextPow2(int n) {
 // Also, as per the comments in cudaScan(), you can implement an
 // "in-place" scan, since the timing harness makes a copy of input and
 // places it in result
+exclusive_scan_kernel_up(int N, float* result, int two_d, int two_dplus1) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < N) {
+        result[index*two_dplus1 + two_dplus1 - 1] += result[index*two_dplus1 + two_d - 1];
+    }
+}
+exclusive_scan_kernel_down_part2(int N, float* result, int two_d, int two_dplus1) {
+    //Use up to add the first num to the second num (part 1)
+    //Then use this to set the first num to old value of second num (which is second-first)
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < N) {
+        int first_index = index*two_dplus1 + two_dplus1 - two_d - 1;
+        int second_index = index*two_dplus1 + two_dplus1 - 1;
+        result[first_index] = result[second_index] - result[first_index];
+    }
+}
+
 void exclusive_scan(int* input, int N, int* result)
 {
 
@@ -54,6 +71,30 @@ void exclusive_scan(int* input, int N, int* result)
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
 
+    //Going to ignore input and do everything in place on result
+    const int threadsPerBlock = 512;
+    const int blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
+
+    //upsweep phase
+    for (int two_d = 1; two_d <= N/2; two_d*=2) {
+        int two_dplus1 = 2*two_d;
+        //Bulk task launch for the parallel_for
+        exclusive_scan_kernel_up<<<blocks, threadsPerBlock>>>(N/two_dplus1, result, two_d, two_dplus1);
+        cudaDeviceSynchronize();
+    }
+
+    //May have to do this in a kernel
+    result[N-1] = 0;
+
+    //downsweep
+    for (int two_d = N/2; two_d >= 1; two_d /= 2) {
+        int two_dplus1 = 2*two_d;
+        //Bulk task launch for the parallel_for
+        exclusive_scan_kernel_up<<<blocks, threadsPerBlock>>>(N/two_dplus1, result, two_d, two_dplus1);
+        cudaDeviceSynchronize();
+        exclusive_scan_kernel_down_part2<<<blocks, threadsPerBlock>>>(N/two_dplus1, result, two_d, two_dplus1);
+        cudaDeviceSynchronize();
+    }
 
 }
 
