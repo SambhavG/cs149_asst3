@@ -636,6 +636,34 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
 
+    //The scheme:
+    //In setup (or after positions are updated) we construct the following data structure
+
+    //First we iterate through all the _small_ circles. For each circle get a list of regions
+    //We now have a map from circle i -> [region a, region b, ...]
+
+    // 0 1 2 3 4 5 (the circle indices)
+    // 2 3 3 4 1 2
+    // 3 5   5 8 3
+    // 5         6
+
+    // Fill all empty spots with (# regions + 1) so they go to the end on the sort
+    // Make the arrays go left to right instead of top to bottom, so arr1 will have the lowest index region a circle is in
+    // There's at most (# regions) arrays, since one circle may be in all regions, but less since we don't process large circles
+
+    //Do the parallel sort on every horizontal array and compute cell_start/end for each one
+
+    //Now, for each horizontal array, we can make a lookup table for each region telling us which circles are in it
+    
+    //Each region can (in parallel) now record which circles belong to it
+
+    //Now go through the large circles and record which regions they're in (can do this in the same parallel loop as small)
+    //After region->[small circles] is recorded, can add large circles to these lists and sort
+
+
+
+
+
     // 256 threads per block is a healthy number
     dim3 blockDim(256, 1);
     dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
