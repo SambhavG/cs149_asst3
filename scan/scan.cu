@@ -42,13 +42,17 @@ static inline int nextPow2(int n) {
 // Also, as per the comments in cudaScan(), you can implement an
 // "in-place" scan, since the timing harness makes a copy of input and
 // places it in result
-exclusive_scan_kernel_up(int N, float* result, int two_d, int two_dplus1) {
+__global__ void
+exclusive_scan_kernel_up(int N, int* result, int two_d, int two_dplus1) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int first_index = index*two_dplus1 + two_d - 1;
+    int second_index = index*two_dplus1 + two_dplus1 - 1;
     if (index < N) {
-        result[index*two_dplus1 + two_dplus1 - 1] += result[index*two_dplus1 + two_d - 1];
+        result[second_index] += result[first_index];
     }
 }
-exclusive_scan_kernel_down(int N, float* result, int two_d, int two_dplus1) {
+__global__ void
+exclusive_scan_kernel_down(int N, int* result, int two_d, int two_dplus1) {
     //Use up to add the first num to the second num (part 1)
     //Then use this to set the first num to old value of second num (which is second-first)
     int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -75,7 +79,7 @@ void exclusive_scan(int* input, int N, int* result)
 
     //Going to ignore input and do everything in place on result
     const int threadsPerBlock = 512;
-
+    N = nextPow2(N);
     //upsweep phase
     for (int two_d = 1; two_d <= N/2; two_d*=2) {
         int two_dplus1 = 2*two_d;
@@ -85,8 +89,8 @@ void exclusive_scan(int* input, int N, int* result)
         cudaDeviceSynchronize();
     }
 
-    //May have to do this in a kernel
-    result[N-1] = 0;
+    int value = 0;
+    cudaMemcpy(&result[N-1], &value, sizeof(int), cudaMemcpyHostToDevice);
 
     //downsweep
     for (int two_d = N/2; two_d >= 1; two_d /= 2) {
@@ -189,6 +193,7 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 // indices `i` for which `device_input[i] == device_input[i+1]`.
 //
 // Returns the total number of pairs found
+__global__ void
 find_repeat_then_copy_kernel(int* device_input, int length, int* intermediate) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index < length) {
@@ -199,9 +204,10 @@ find_repeat_then_copy_kernel(int* device_input, int length, int* intermediate) {
         intermediate[index] = device_input[index];
     }
 }
+__global__ void
 populate_repeat_indices_kernel(int length, int* isRepeat, int* indexToStore, int* result) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < length && input[index]) {
+    if (index < length && isRepeat[index]) {
         result[indexToStore[index+1]] = index;
     }
 }
@@ -227,20 +233,15 @@ int find_repeats(int* device_input, int length, int* device_output) {
     //First, set each value to 0 if not duplicate, 1 if so on intermediate
     const int threadsPerBlock = 512;
     const int blocks = (length + threadsPerBlock - 1) / threadsPerBlock;
-    find_repeat_kernel<<<blocks, threadsPerBlock>>>(device_input, length, intermediate);
+    find_repeat_then_copy_kernel<<<blocks, threadsPerBlock>>>(device_input, length, intermediate);
     cudaDeviceSynchronize();
-
     //Get prefix sums of intermediate
     //If it started out as 0 1 1 0 0 0 1 0 1, it will become 0 0 1 2 2 2 2 3 3 4
     //   0 1 1 0 0 0 1 0 1
     // 0 0 1 2 2 2 2 3 3 4
-    //First, copy intermediate to input so both are the binary array
-    copy_a_to_b_kernel<<<blocks, threadsPerBlock>>>(intermediate, length, device_input);
-    cudaDeviceSynchronize();
-    //Next, compute prefix sums on intermediate
     exclusive_scan(nullptr, length, intermediate);
     //For each input[i], if it's 1, set output[intermediate[i+1]] to i
-    populate_repeat_indices_kernel(length, device_input, intermediate, device_output);
+    populate_repeat_indices_kernel<<<blocks, threadsPerBlock>>>(length, device_input, intermediate, device_output);
     
     return 0; 
 }
