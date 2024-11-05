@@ -189,16 +189,14 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 // indices `i` for which `device_input[i] == device_input[i+1]`.
 //
 // Returns the total number of pairs found
-find_repeat_kernel(int* device_input, int length, int* device_output) {
+find_repeat_then_copy_kernel(int* device_input, int length, int* intermediate) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index < length) {
-        device_output[index] = (device_input[index] == device_input[index+1]);
+        intermediate[index] = (device_input[index] == device_input[index+1]);
     }
-}
-copy_a_to_b_kernel(int* a, int length, int* b) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    __syncthreads();
     if (index < length) {
-        b[index] = a[index];
+        intermediate[index] = device_input[index];
     }
 }
 populate_repeat_indices_kernel(int length, int* isRepeat, int* indexToStore, int* result) {
@@ -206,7 +204,6 @@ populate_repeat_indices_kernel(int length, int* isRepeat, int* indexToStore, int
     if (index < length && input[index]) {
         result[indexToStore[index+1]] = index;
     }
-
 }
 
 int find_repeats(int* device_input, int length, int* device_output) {
@@ -238,7 +235,7 @@ int find_repeats(int* device_input, int length, int* device_output) {
     //   0 1 1 0 0 0 1 0 1
     // 0 0 1 2 2 2 2 3 3 4
     //First, copy intermediate to input so both are the binary array
-    copy_a_to_b_kernel<<<blocks, threadsPerBlock>>>(intermediate, length, input);
+    copy_a_to_b_kernel<<<blocks, threadsPerBlock>>>(intermediate, length, device_input);
     cudaDeviceSynchronize();
     //Next, compute prefix sums on intermediate
     exclusive_scan(nullptr, length, intermediate);
