@@ -14,6 +14,11 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#define BLOCKSIZE 512
+#define SCAN_BLOCK_DIM   BLOCKSIZE  // needed by sharedMemExclusiveScan implementation
+#include "exclusiveScan.cu_inl"
+#include "circleBoxTest.cu_inl"
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -50,6 +55,18 @@ __constant__ float  cuConstNoise1DValueTable[256];
 #define COLOR_MAP_SIZE 5
 __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 
+
+// size of grid (one dimension)
+__constant__ int num_grid_cells = 16;
+// total number of cells
+__constant__ int num_regions = num_grid_cells*num_grid_cells;
+
+// max num regions a small circle should hit (one dim, actual is x^2)
+__constant__ int max_regions_per_small = 5;
+
+// largest size of small circle (radius) s.t. it hits at most max_regions_per_small^2 regions
+// For 16x16 grid and at most 25 cells per circle, this is r=.125
+__constant__ float small_size = (1/(float) num_grid_cells) * ((float) max_regions_per_small-1)/2.0;
 
 // including parts of the CUDA code from external files to keep this
 // file simpler and to seperate code that should not be modified
@@ -633,15 +650,107 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
+__global__ void
+kernelRecordSpotsOfCircles(int N, int* regions_to_circles_binary) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_circles = cuConstRendererParams.numCircles;
+    if (index >= num_circles * num_regions) return;
+
+    //Threads 0..num_circles-1 correspond with region 0
+    int this_circle = index % num_circles;
+    int this_region = index / num_circles;
+    
+    //Get pos for this circle
+    float x = cuConstRendererParams.position[index*3];
+    float y = cuConstRendererParams.position[index*3+1];
+    float r = cuConstRendererParams.radius[index];
+
+    //Get bounds for this region
+    int x_units = this_region % num_grid_cells;
+    int y_units = this_region / num_grid_cells;
+    float x_left = x_units * (1/num_grid_cells);
+    float x_right = (x_units+1) * (1/num_grid_cells);
+    float y_top = y_units * (1/num_grid_cells);
+    float y_bottom = y_units * (1/num_grid_cells); 
+
+    //Check if this region contains this circle
+    if (!circleInBoxConservative(x, y, r, x_left, x_right, y_top, y_bottom)) return;
+    if (!circleInBox(x, y, r, x_left, x_right, y_top, y_bottom)) return;
+
+    regions_to_circles_binary[index] = 1;
+}
+
+static inline int nextPow2(int n) {
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n++;
+    return n;
+}
+
+
+//What the current function does:
+//Takes a binary array of length power of 2 and computes a cumsum in place on it
+
+//What we want to do:
+//Take an array of either 256 or 1024 arrays. Cumsum each one in place
+
 
 __global__ void
-kernelRecordSpotsOfCircles(int* table, int N) {
+exclusive_scan_kernel_up(int N, int* result, int two_d, int two_dplus1) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    //If index < N, record data for circle "index"
+    int first_index = index*two_dplus1 + two_d - 1;
+    int second_index = index*two_dplus1 + two_dplus1 - 1;
     if (index < N) {
-        //Find all the regions containing this circle
+        result[second_index] += result[first_index];
     }
+}
+__global__ void
+exclusive_scan_kernel_down(int N, int* result, int two_d, int two_dplus1) {
+    //Use up to add the first num to the second num (part 1)
+    //Then use this to set the first num to old value of second num (which is second-first)
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int first_index = index*two_dplus1 + two_d - 1;
+    int second_index = index*two_dplus1 + two_dplus1 - 1;
+    if (index < N) {
+        int temp = result[second_index];
+        result[second_index] += result[first_index];
+        result[first_index] = temp;
+    }
+}
+
+void exclusive_scan(int N, int* result) {
+    //result is a numregions x pow2numcircles array
+    //Exclusive scan each region
+
+    int N = nextPow2(cuConstRendererParams.numCircles);
+    //upsweep phase
+    for (int two_d = 1; two_d <= N/2; two_d*=2) {
+        int two_dplus1 = 2*two_d;
+        int blocks = (N/two_dplus1 + BLOCKSIZE - 1) / BLOCKSIZE;
+        //Bulk task launch for the parallel_for
+        for (int region = 0; region < cuConstRendererParams.numRegions; region++) {
+
+        exclusive_scan_kernel_up<<<blocks, BLOCKSIZE>>>(N/two_dplus1, result, two_d, two_dplus1);
+        }
+        cudaDeviceSynchronize();
+    }
+
+    int value = 0;
+    cudaMemcpy(&result[N-1], &value, sizeof(int), cudaMemcpyHostToDevice);
+
+    //downsweep
+    for (int two_d = N/2; two_d >= 1; two_d /= 2) {
+        int two_dplus1 = 2*two_d;
+        int blocks = (N/two_dplus1 + BLOCKSIZE - 1) / BLOCKSIZE;
+        //Bulk task launch for the parallel_for
+        exclusive_scan_kernel_down<<<blocks, BLOCKSIZE>>>(N/two_dplus1, result, two_d, two_dplus1);
+        cudaDeviceSynchronize();
+    }
+
 }
 
 
