@@ -1,0 +1,7 @@
+{
+  "files.associations": {
+    "*.svelte": "svelte",
+    "*.cu_inl": "cpp",
+    "functional": "cpp"
+  }
+}
