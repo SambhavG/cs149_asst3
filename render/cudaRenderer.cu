@@ -11,13 +11,18 @@
 #include <cuda_runtime.h>
 #include <driver_functions.h>
 
+#include <thrust/scan.h>
+#include <thrust/device_ptr.h>
+#include <thrust/device_malloc.h>
+#include <thrust/device_free.h>
+
 #include "cudaRenderer.h"
 #include "image.h"
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
 
-#define BLOCKSIZE 256
+#define BLOCKSIZE 512
 #define SCAN_BLOCK_DIM   BLOCKSIZE  // needed by sharedMemExclusiveScan implementation
 #include "exclusiveScan.cu_inl"
 #include "circleBoxTest.cu_inl"
@@ -575,7 +580,7 @@ CudaRenderer::setup() {
     cudaMemcpy(cudaDeviceColor, color, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceRadius, radius, sizeof(float) * numCircles, cudaMemcpyHostToDevice);
 
-    numCirclesUp = nextPow2(numCircles+1);
+    numCirclesUp = numCircles + 1; //nextPow2(numCircles+1);
     numGridCells = 16;
     numRegions = numGridCells * numGridCells;
     maxRegionsPerSmall = 5;
@@ -790,6 +795,52 @@ void exclusive_scan(int* result, int numCirclesUp, int numRegions) {
 
 }
 
+void exclusive_scan_v2(int* result, int numCirclesUp, int numRegions) {
+
+    thrust::device_ptr<int> d_input = thrust::device_malloc<int>(numCirclesUp*numRegions);
+    cudaMemcpy(d_input.get(), result, numCirclesUp*numRegions * sizeof(int), cudaMemcpyDeviceToDevice);
+
+    //Run thrust on each subarray
+    for (int region = 0; region < numRegions; region++) {
+        thrust::exclusive_scan(d_input + region*numCirclesUp, d_input + (region+1)*numCirclesUp, d_input + region*numCirclesUp);
+    }
+    cudaCheckError(cudaDeviceSynchronize());
+
+    cudaMemcpy(result, d_input.get(), numCirclesUp*numRegions * sizeof(int), cudaMemcpyDeviceToDevice);
+    thrust::device_free(d_input);
+    cudaCheckError(cudaDeviceSynchronize());
+    return;
+
+    //result is a numregions x pow2numcircles array
+    //Exclusive scan each region
+    int N = numCirclesUp;
+    //upsweep phase
+    for (int two_d = 1; two_d <= N/2; two_d*=2) {
+        int two_dplus1 = 2*two_d;
+        int blocks = (N/two_dplus1 + BLOCKSIZE - 1) / BLOCKSIZE;
+        //Bulk task launch for the parallel_for
+        for (int region = 0; region < numRegions; region++) {
+            exclusive_scan_kernel_up<<<blocks, BLOCKSIZE>>>(N/two_dplus1, result+N*region, two_d);
+        }
+        cudaCheckError(cudaDeviceSynchronize());
+    }
+
+    int zero_blocks = (numRegions + BLOCKSIZE - 1) / BLOCKSIZE;
+    set_last_to_zero_kernel<<<zero_blocks, BLOCKSIZE>>>(numRegions, N, result);
+
+    //downsweep
+    for (int two_d = N/2; two_d >= 1; two_d /= 2) {
+        int two_dplus1 = 2*two_d;
+        int blocks = (N/two_dplus1 + BLOCKSIZE - 1) / BLOCKSIZE;
+        //Bulk task launch for the parallel_for
+        for (int region = 0; region < numRegions; region++) {
+            exclusive_scan_kernel_down<<<blocks, BLOCKSIZE>>>(N/two_dplus1, result+N*region, two_d);
+        }
+        cudaCheckError(cudaDeviceSynchronize());
+    }
+
+}
+
 __global__ void
 populate_indices_kernel(int* binary, int* cumulative, int* result) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -852,7 +903,7 @@ render_pixel_kernel(bool useData, int* regionTable, int* circlesPerRegion) {
 void
 CudaRenderer::render() {
 
-    if (numCircles <= 1218) {
+    if (numCircles <= 1000) {
         dim3 blockDim(256, 1);
         dim3 pixelsDim((imageWidth * imageHeight + blockDim.x - 1) / blockDim.x);
         render_pixel_kernel<<<pixelsDim, blockDim>>>(false, nullptr, nullptr);
@@ -888,7 +939,7 @@ CudaRenderer::render() {
     kernelRecordSpotsOfCircles<<<gridDim, blockDim>>>(cudaDeviceRegionTableBinary);
     cudaCheckError(cudaDeviceSynchronize());
     endTime = CycleTimer::currentSeconds();
-    printf("Alloc arrays: %.3f ms\n", 1000.f * (endTime-startTime));
+    printf("Record spots: %.3f ms\n", 1000.f * (endTime-startTime));
 
     // length = numCirclesUp * numRegions;
     // vals = (int*) malloc(length*sizeof(int));
@@ -913,7 +964,7 @@ CudaRenderer::render() {
     printf("Copy table: %.3f ms\n", 1000.f * (endTime-startTime));
     
     startTime = CycleTimer::currentSeconds();
-    exclusive_scan(cudaDeviceRegionTableCumulative, numCirclesUp, numRegions);
+    exclusive_scan_v2(cudaDeviceRegionTableCumulative, numCirclesUp, numRegions);
     endTime = CycleTimer::currentSeconds();
     printf("Exclusive scan: %.3f ms\n", 1000.f * (endTime-startTime));
 
