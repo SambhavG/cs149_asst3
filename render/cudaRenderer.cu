@@ -5,7 +5,7 @@
 #include <vector>
 #include <iostream>
 #include <stdexcept>
-
+#include "cycleTimer.h"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -17,7 +17,7 @@
 #include "sceneLoader.h"
 #include "util.h"
 
-#define BLOCKSIZE 512
+#define BLOCKSIZE 256
 #define SCAN_BLOCK_DIM   BLOCKSIZE  // needed by sharedMemExclusiveScan implementation
 #include "exclusiveScan.cu_inl"
 #include "circleBoxTest.cu_inl"
@@ -357,8 +357,8 @@ __global__ void kernelAdvanceSnowflake() {
 // given a pixel and a circle, determines the contribution to the
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
-__device__ __inline__ void
-shadePixel(int circleIndex, float2 pixelCenter, float4* imagePtr) {
+__device__ __inline__ float4
+shadePixel(int circleIndex, float2 pixelCenter, float4 existingColor) {
     float px = cuConstRendererParams.position[circleIndex*3];
     float py = cuConstRendererParams.position[circleIndex*3+1];
     float pz = cuConstRendererParams.position[circleIndex*3+2];
@@ -409,18 +409,19 @@ shadePixel(int circleIndex, float2 pixelCenter, float4* imagePtr) {
     // BEGIN SHOULD-BE-ATOMIC REGION
     // global memory read
 
-    float4 existingColor = *imagePtr;
+    // float4 existingColor = *imagePtr;
     float4 newColor;
     newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
     newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
     newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
     newColor.w = alpha + existingColor.w;
-
+    return newColor;
     // global memory write
-    *imagePtr = newColor;
+    // *imagePtr = newColor;
 
     // END SHOULD-BE-ATOMIC REGION
 }
+
 
 // kernelRenderCircles -- (CUDA device code)
 //
@@ -696,7 +697,7 @@ kernelRecordSpotsOfCircles(int* regions_to_circles_binary) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= cuConstRendererParams.numCirclesUp * cuConstRendererParams.numRegions) return;
 
-    //Threads 0..num_circles-1 correspond with region 0
+    //Threads 0..numCircles-1 correspond with region 0
     int this_circle = index % cuConstRendererParams.numCirclesUp;
     int this_region = index / cuConstRendererParams.numCirclesUp;
     if (this_circle >= cuConstRendererParams.numCircles) return;
@@ -761,7 +762,6 @@ set_last_to_zero_kernel(int M, int N, int* result) {
 void exclusive_scan(int* result, int numCirclesUp, int numRegions) {
     //result is a numregions x pow2numcircles array
     //Exclusive scan each region
-
     int N = numCirclesUp;
     //upsweep phase
     for (int two_d = 1; two_d <= N/2; two_d*=2) {
@@ -808,32 +808,42 @@ populate_counts_kernel(int* cumulative, int* counts) {
 }
 
 __global__ void
-render_pixel_kernel(int* regionTable, int* circlesPerRegion) {
+render_pixel_kernel(bool useData, int* regionTable, int* circlesPerRegion) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     
-    //Figure out which region we're in
     int num_pixels = cuConstRendererParams.imageWidth * cuConstRendererParams.imageHeight;
     if (index >= num_pixels) return;
     int pixel_x = index % cuConstRendererParams.imageWidth;
     int pixel_y = index / cuConstRendererParams.imageHeight;
     float pixelWidth = 1.f / cuConstRendererParams.imageWidth;
     float pixelHeight = 1.f / cuConstRendererParams.imageHeight;
-    float regionWidth = 1.f / cuConstRendererParams.numGridCells;
-    float regionHeight = 1.f / cuConstRendererParams.numGridCells;
     float pixelCenter_x = pixelWidth * (static_cast<float>(pixel_x) + 0.5f);
     float pixelCenter_y = pixelHeight * (static_cast<float>(pixel_y) + 0.5f);
     float2 pixelCenterNorm = make_float2(pixelCenter_x, pixelCenter_y);
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixel_y * cuConstRendererParams.imageWidth + pixel_x)]);
+    float4 currentColor = *imgPtr;
+    
+    //Render all circles
+    if (!useData) {
+        for (int i = 0; i < cuConstRendererParams.numCircles; i++) {
+            currentColor = shadePixel(i, pixelCenterNorm, currentColor);
+        }
+        *imgPtr = currentColor;
+        return;
+    }
+
+
+    float regionWidth = 1.f / cuConstRendererParams.numGridCells;
+    float regionHeight = 1.f / cuConstRendererParams.numGridCells;
     int region_x = static_cast<int>(pixelCenter_x / regionWidth);
     int region_y = static_cast<int>(pixelCenter_y / regionHeight);
     int region = region_x + region_y * cuConstRendererParams.numGridCells;
 
-
-    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixel_y * cuConstRendererParams.imageWidth + pixel_x)]);
-
     for (int i = 0; i < circlesPerRegion[region]; i++) {
         int index = regionTable[region*cuConstRendererParams.numCirclesUp + i];
-        shadePixel(index, pixelCenterNorm, imgPtr);
+        currentColor = shadePixel(index, pixelCenterNorm, currentColor);
     }
+    *imgPtr = currentColor;
 }
 
 // rgb, rgby, rand10k, rand100k, rand1M, biglittle, littlebig, pattern, micro2M,
@@ -841,6 +851,17 @@ render_pixel_kernel(int* regionTable, int* circlesPerRegion) {
 
 void
 CudaRenderer::render() {
+
+    if (numCircles <= 1218) {
+        dim3 blockDim(256, 1);
+        dim3 pixelsDim((imageWidth * imageHeight + blockDim.x - 1) / blockDim.x);
+        render_pixel_kernel<<<pixelsDim, blockDim>>>(false, nullptr, nullptr);
+        cudaCheckError(cudaDeviceSynchronize());
+        return;
+    }
+
+    double startTime = CycleTimer::currentSeconds();
+
     int length;
     int* vals;
     int* cudaDeviceRegionTableBinary = nullptr;
@@ -856,12 +877,19 @@ CudaRenderer::render() {
     cudaMalloc(&cudaDeviceRegionTable, sizeof(int) * numCirclesUp * numRegions);
     cudaMalloc(&cudaDeviceCirclesPerRegion, sizeof(int) * numRegions);
 
+    double endTime = CycleTimer::currentSeconds();
+    printf("Alloc arrays: %.3f ms\n", 1000.f * (endTime-startTime));
+
+
+    startTime = CycleTimer::currentSeconds();
     //Now, do a task launch of the kernel over all circles
     dim3 blockDim(256, 1);
     dim3 gridDim((numCirclesUp * numRegions + blockDim.x - 1) / blockDim.x);
     kernelRecordSpotsOfCircles<<<gridDim, blockDim>>>(cudaDeviceRegionTableBinary);
     cudaCheckError(cudaDeviceSynchronize());
-    
+    endTime = CycleTimer::currentSeconds();
+    printf("Alloc arrays: %.3f ms\n", 1000.f * (endTime-startTime));
+
     // length = numCirclesUp * numRegions;
     // vals = (int*) malloc(length*sizeof(int));
     // cudaMemcpy(vals, cudaDeviceRegionTableBinary, length*sizeof(int), cudaMemcpyDeviceToHost);
@@ -876,11 +904,18 @@ CudaRenderer::render() {
     
     // cudaFree(vals);
 
-    cudaCheckError(cudaDeviceSynchronize());
+    // cudaCheckError(cudaDeviceSynchronize());
 
     //Copy the table and run cumsum on it
+    startTime = CycleTimer::currentSeconds();
     cudaMemcpy(cudaDeviceRegionTableCumulative, cudaDeviceRegionTableBinary, numCirclesUp * numRegions * sizeof(int), cudaMemcpyDeviceToDevice);
+    endTime = CycleTimer::currentSeconds();
+    printf("Copy table: %.3f ms\n", 1000.f * (endTime-startTime));
+    
+    startTime = CycleTimer::currentSeconds();
     exclusive_scan(cudaDeviceRegionTableCumulative, numCirclesUp, numRegions);
+    endTime = CycleTimer::currentSeconds();
+    printf("Exclusive scan: %.3f ms\n", 1000.f * (endTime-startTime));
 
     // length = numCirclesUp * numRegions;
     // vals = (int*) malloc(length*sizeof(int));
@@ -897,10 +932,13 @@ CudaRenderer::render() {
     // cudaFree(vals);
 
     //Generate condensed regions->circles map
+    startTime = CycleTimer::currentSeconds();
     populate_indices_kernel<<<gridDim, blockDim>>>(cudaDeviceRegionTableBinary, cudaDeviceRegionTableCumulative, cudaDeviceRegionTable);
     dim3 gridRegionsDim((numRegions + blockDim.x - 1) / blockDim.x);
     populate_counts_kernel<<<gridRegionsDim, blockDim>>>(cudaDeviceRegionTableCumulative, cudaDeviceCirclesPerRegion);
     cudaCheckError(cudaDeviceSynchronize());
+    endTime = CycleTimer::currentSeconds();
+    printf("Populate indices: %.3f ms\n", 1000.f * (endTime-startTime));
 
     // length = numCirclesUp * numRegions;
     // vals = (int*) malloc(length*sizeof(int));
@@ -916,9 +954,12 @@ CudaRenderer::render() {
     // cudaFree(vals);
 
     //Render everything
+    startTime = CycleTimer::currentSeconds();
     dim3 pixelsDim((imageWidth * imageHeight + blockDim.x - 1) / blockDim.x);
-    render_pixel_kernel<<<pixelsDim, blockDim>>>(cudaDeviceRegionTable, cudaDeviceCirclesPerRegion);
+    render_pixel_kernel<<<pixelsDim, blockDim>>>(true, cudaDeviceRegionTable, cudaDeviceCirclesPerRegion);
     cudaCheckError(cudaDeviceSynchronize());
+    endTime = CycleTimer::currentSeconds();
+    printf("Rendering pixels: %.3f ms\n", 1000.f * (endTime-startTime));
 
     cudaFree(cudaDeviceRegionTableBinary);
     cudaFree(cudaDeviceRegionTableCumulative);
