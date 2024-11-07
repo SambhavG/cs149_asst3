@@ -12,20 +12,21 @@ Device 0: NVIDIA T4G
 
 Running benchmark, 1 frames, beginning at frame 0 ...
 Dumping frames to logs/output_xxx.ppm
-Alloc arrays: 0.509 ms
-Alloc arrays: 0.136 ms
-Copy table: 0.014 ms
-Exclusive scan: 5.186 ms
-Populate indices: 0.173 ms
-Rendering pixels: 15.470 ms
+Alloc arrays: 0.524 ms
+Record spots: 0.133 ms
+Copy table: 0.017 ms
+Exclusive scan - just the kernel part: 4.664 ms
+Exclusive scan: 5.023 ms
+Populate indices: 0.142 ms
+Rendering pixels: 15.458 ms
 Copying image data from device
 Wrote image file logs/output_0000.ppm
 Copying image data from device
 ***************** Correctness check passed **************************
-Clear:    0.1358 ms
-Advance:  0.0021 ms
-Render:   22.4694 ms
-Total:    22.6073 ms
-File IO:  89.8621 ms
+Clear:    0.1318 ms
+Advance:  0.0019 ms
+Render:   21.9808 ms
+Total:    22.1145 ms
+File IO:  90.5486 ms
 
-Overall:  8.6498 sec (note units are seconds)
+Overall:  8.5958 sec (note units are seconds)
