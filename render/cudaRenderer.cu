@@ -836,6 +836,9 @@ render_pixel_kernel(int* regionTable, int* circlesPerRegion) {
     }
 }
 
+// rgb, rgby, rand10k, rand100k, rand1M, biglittle, littlebig, pattern, micro2M,
+                    //   bouncingballs, fireworks, hypnosis, snow, snowsingle
+
 void
 CudaRenderer::render() {
     int length;
