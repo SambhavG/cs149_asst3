@@ -21,6 +21,15 @@ private:
     float* color;
     float* radius;
 
+    int numCirclesUp;
+    int numGridCells;
+    int numRegions;
+    int maxRegionsPerSmall;
+    float smallSize;
+
+    int imageWidth;
+    int imageHeight;
+
     float* cudaDevicePosition;
     float* cudaDeviceVelocity;
     float* cudaDeviceColor;

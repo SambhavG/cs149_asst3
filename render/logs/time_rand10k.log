@@ -1,0 +1,30 @@
+Rendering to 1024x1024 image
+Loaded scene with 10000 circles
+---------------------------------------------------------
+Initializing CUDA for CudaRenderer
+Found 1 CUDA devices
+Device 0: NVIDIA T4G
+   SMs:        40
+   Global mem: 14918 MB
+   CUDA Cap:   7.5
+---------------------------------------------------------
+WARNING: You're not running on a fast GPU, please consider using NVIDIA GTX 480, 670 or 780.
+---------------------------------------------------------
+
+Running benchmark, 4 frames, beginning at frame 0 ...
+Dumping frames to logs/output_xxx.ppm
+Copying image data from device
+Wrote image file logs/output_0000.ppm
+Copying image data from device
+Wrote image file logs/output_0001.ppm
+Copying image data from device
+Wrote image file logs/output_0002.ppm
+Copying image data from device
+Wrote image file logs/output_0003.ppm
+Clear:    0.0953 ms
+Advance:  0.0020 ms
+Render:   2.6416 ms
+Total:    2.7389 ms
+File IO:  99.0451 ms
+
+Overall:  0.4072 sec (note units are seconds)

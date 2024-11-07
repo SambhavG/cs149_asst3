@@ -194,22 +194,21 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 //
 // Returns the total number of pairs found
 __global__ void
-find_repeat_then_copy_kernel(int* device_input, int length, int* intermediate) {
+find_repeat(int* device_input, int length, int intermediate_length, int* intermediate) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < length) {
-        intermediate[index] = (device_input[index] == device_input[index+1]);
-    }
-    __syncthreads();
-    if (index < length) {
-        intermediate[index] = device_input[index];
-    }
+    if (index >= intermediate_length) return;
+    intermediate[index] = 0;
+    if (index >= length - 1) return;
+    intermediate[index] = (device_input[index] == device_input[index+1]);
 }
 __global__ void
 populate_repeat_indices_kernel(int length, int* isRepeat, int* indexToStore, int* result) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < length && isRepeat[index]) {
-        result[indexToStore[index+1]] = index;
-    }
+    if (index >= length) return;
+    if (!isRepeat[index]) return;
+    
+    result[indexToStore[index+1]-1] = index;
+    
 }
 
 int find_repeats(int* device_input, int length, int* device_output) {
@@ -226,24 +225,32 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
 
+
     //Create intermediate array
     int* intermediate = nullptr;
-    cudaMalloc(&intermediate, length);
+    int intermediate_length = nextPow2(length+1);
+    cudaMalloc(&intermediate, intermediate_length * sizeof(int));
 
     //First, set each value to 0 if not duplicate, 1 if so on intermediate
     const int threadsPerBlock = 512;
-    const int blocks = (length + threadsPerBlock - 1) / threadsPerBlock;
-    find_repeat_then_copy_kernel<<<blocks, threadsPerBlock>>>(device_input, length, intermediate);
+    int blocks = (intermediate_length + threadsPerBlock - 1) / threadsPerBlock;
+    find_repeat<<<blocks, threadsPerBlock>>>(device_input, length, intermediate_length, intermediate);
     cudaDeviceSynchronize();
+    //Copy the data to device_input
+    cudaMemcpy(device_input, intermediate, length*sizeof(int), cudaMemcpyDeviceToDevice);
     //Get prefix sums of intermediate
     //If it started out as 0 1 1 0 0 0 1 0 1, it will become 0 0 1 2 2 2 2 3 3 4
     //   0 1 1 0 0 0 1 0 1
     // 0 0 1 2 2 2 2 3 3 4
-    exclusive_scan(nullptr, length, intermediate);
-    //For each input[i], if it's 1, set output[intermediate[i+1]] to i
+    exclusive_scan(nullptr, intermediate_length, intermediate);
+    blocks = (length + threadsPerBlock - 1) / threadsPerBlock;
+
     populate_repeat_indices_kernel<<<blocks, threadsPerBlock>>>(length, device_input, intermediate, device_output);
-    
-    return 0; 
+
+    int ret = 0;
+    cudaMemcpy(&ret, intermediate+length, sizeof(int), cudaMemcpyDeviceToHost);
+
+    return ret;
 }
 
 

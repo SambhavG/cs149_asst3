@@ -161,6 +161,8 @@ int main(int argc, char** argv)
         cuda_renderer->allocOutputImage(imageSize, imageSize);
         cuda_renderer->loadScene(sceneName);
         cuda_renderer->setup();
+        // printf("Finished setting up\n");
+
 
         // Check the correctness
         CheckBenchmark(ref_renderer, cuda_renderer, 0, 1, frameFilename);

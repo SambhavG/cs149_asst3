@@ -3,6 +3,9 @@
 #include <math.h>
 #include <stdio.h>
 #include <vector>
+#include <iostream>
+#include <stdexcept>
+
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -18,6 +21,23 @@
 #define SCAN_BLOCK_DIM   BLOCKSIZE  // needed by sharedMemExclusiveScan implementation
 #include "exclusiveScan.cu_inl"
 #include "circleBoxTest.cu_inl"
+
+#define DEBUG
+
+#ifdef DEBUG
+#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess)
+   {
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+        cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -36,6 +56,12 @@ struct GlobalConstants {
     int imageWidth;
     int imageHeight;
     float* imageData;
+
+    int numCirclesUp;
+    int numGridCells;
+    int numRegions;
+    int maxRegionsPerSmall;
+    float smallSize;
 };
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -70,8 +96,6 @@ static inline int nextPow2(int n) {
     n++;
     return n;
 }
-
-
 
 // kernelClearImageSnowflake -- (CUDA device code)
 //
@@ -337,6 +361,7 @@ __device__ __inline__ void
 shadePixel(int circleIndex, float2 pixelCenter, float4* imagePtr) {
     float px = cuConstRendererParams.position[circleIndex*3];
     float py = cuConstRendererParams.position[circleIndex*3+1];
+    float pz = cuConstRendererParams.position[circleIndex*3+2];
 
     float diffX = px - pixelCenter.x;
     float diffY = py - pixelCenter.y;
@@ -368,7 +393,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float4* imagePtr) {
         float normPixelDist = sqrt(pixelDist) / rad;
         rgb = lookupColor(normPixelDist);
 
-        float maxAlpha = .6f + .4f * (1.f-p.z);
+        float maxAlpha = .6f + .4f * (1.f-pz);
         maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
         alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
 
@@ -402,48 +427,48 @@ shadePixel(int circleIndex, float2 pixelCenter, float4* imagePtr) {
 // Each thread renders a circle.  Since there is no protection to
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
-__global__ void kernelRenderCircles() {
+// __global__ void kernelRenderCircles() {
 
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
+//     int index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (index >= cuConstRendererParams.numCircles)
-        return;
+//     if (index >= cuConstRendererParams.numCircles)
+//         return;
 
-    int index3 = 3 * index;
+//     int index3 = 3 * index;
 
-    // read position and radius
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[index];
+//     // read position and radius
+//     float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+//     float  rad = cuConstRendererParams.radius[index];
 
-    // compute the bounding box of the circle. The bound is in integer
-    // screen coordinates, so it's clamped to the edges of the screen.
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-    short minX = static_cast<short>(imageWidth * (p.x - rad));
-    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    short minY = static_cast<short>(imageHeight * (p.y - rad));
-    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+//     // compute the bounding box of the circle. The bound is in integer
+//     // screen coordinates, so it's clamped to the edges of the screen.
+//     short imageWidth = cuConstRendererParams.imageWidth;
+//     short imageHeight = cuConstRendererParams.imageHeight;
+//     short minX = static_cast<short>(imageWidth * (p.x - rad));
+//     short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+//     short minY = static_cast<short>(imageHeight * (p.y - rad));
+//     short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
 
-    // a bunch of clamps.  Is there a CUDA built-in for this?
-    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+//     // a bunch of clamps.  Is there a CUDA built-in for this?
+//     short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+//     short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+//     short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+//     short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
 
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
+//     float invWidth = 1.f / imageWidth;
+//     float invHeight = 1.f / imageHeight;
 
-    // for all pixels in the bonding box
-    for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-        for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(index, pixelCenterNorm, p, imgPtr);
-            imgPtr++;
-        }
-    }
-}
+//     // for all pixels in the bonding box
+//     for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
+//         float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
+//         for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
+//             float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+//                                                  invHeight * (static_cast<float>(pixelY) + 0.5f));
+//             shadePixel(index, pixelCenterNorm, p, imgPtr);
+//             imgPtr++;
+//         }
+//     }
+// }
 
 ////////////////////////////////////////////////////////////////////////////////////////
 
@@ -549,6 +574,15 @@ CudaRenderer::setup() {
     cudaMemcpy(cudaDeviceColor, color, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceRadius, radius, sizeof(float) * numCircles, cudaMemcpyHostToDevice);
 
+    numCirclesUp = nextPow2(numCircles+1);
+    numGridCells = 16;
+    numRegions = numGridCells * numGridCells;
+    maxRegionsPerSmall = 5;
+    smallSize = (1/(float) numGridCells) * ((float) maxRegionsPerSmall-1)/2.0;
+
+    imageWidth = image->width;
+    imageHeight = image->height;
+
     // Initialize parameters in constant memory.  We didn't talk about
     // constant memory in class, but the use of read-only constant
     // memory here is an optimization over just sticking these values
@@ -560,20 +594,19 @@ CudaRenderer::setup() {
     GlobalConstants params;
     params.sceneName = sceneName;
     params.numCircles = numCircles;
-    params.numCirclesUp = nextPow2(numCircles);
-    params.imageWidth = image->width;
-    params.imageHeight = image->height;
+    params.imageWidth = imageWidth;
+    params.imageHeight = imageHeight;
     params.position = cudaDevicePosition;
     params.velocity = cudaDeviceVelocity;
     params.color = cudaDeviceColor;
     params.radius = cudaDeviceRadius;
     params.imageData = cudaDeviceImageData;
 
-    params.numGridCells = 16;
-    params.numRegions = params.numGridCells * params.numGridCells;
-    params.maxRegionsPerSmall = 5;
-    params.smallSize = (1/(float) params.numGridCells) * ((float) params.maxRegionsPerSmall-1)/2.0;
-
+    params.numCirclesUp = numCirclesUp;
+    params.numGridCells = numGridCells;
+    params.numRegions = numRegions;
+    params.maxRegionsPerSmall = maxRegionsPerSmall;
+    params.smallSize = smallSize;
 
     cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
 
@@ -669,19 +702,25 @@ kernelRecordSpotsOfCircles(int* regions_to_circles_binary) {
     if (this_circle >= cuConstRendererParams.numCircles) return;
     
     //Get pos for this circle
-    float x = cuConstRendererParams.position[index*3];
-    float y = cuConstRendererParams.position[index*3+1];
-    float r = cuConstRendererParams.radius[index];
+    float x = cuConstRendererParams.position[this_circle*3];
+    float y = cuConstRendererParams.position[this_circle*3+1];
+    float r = cuConstRendererParams.radius[this_circle];
 
     //Get bounds for this region
     int x_units = this_region % cuConstRendererParams.numGridCells;
     int y_units = this_region / cuConstRendererParams.numGridCells;
-    float x_left = x_units * (1/cuConstRendererParams.numGridCells);
-    float x_right = (x_units+1) * (1/cuConstRendererParams.numGridCells);
-    float y_top = y_units * (1/cuConstRendererParams.numGridCells);
-    float y_bottom = y_units * (1/cuConstRendererParams.numGridCells); 
+    float cell_size = 1/((float) cuConstRendererParams.numGridCells);
+
+    float x_left = x_units * cell_size;
+    float x_right = (x_units+1) * cell_size;
+    float y_bottom = y_units * cell_size;
+    float y_top = (y_units+1) * cell_size;
+    int indVal = 1;
+    // if (this_circle == indVal) printf("%f %f %f %f\n", x_left, x_right, y_top, y_bottom);
+    //if (this_circle == indVal) printf("%f %f %f\n", x, y, r);
 
     //Check if this region contains this circle
+
     if (!circleInBoxConservative(x, y, r, x_left, x_right, y_top, y_bottom)) return;
     if (!circleInBox(x, y, r, x_left, x_right, y_top, y_bottom)) return;
 
@@ -719,34 +758,34 @@ set_last_to_zero_kernel(int M, int N, int* result) {
     result[N - 1 + index*N] = 0;
 }
 
-void exclusive_scan(int* result) {
+void exclusive_scan(int* result, int numCirclesUp, int numRegions) {
     //result is a numregions x pow2numcircles array
     //Exclusive scan each region
 
-    int N = cuConstRendererParams.numCirclesUp;
+    int N = numCirclesUp;
     //upsweep phase
     for (int two_d = 1; two_d <= N/2; two_d*=2) {
         int two_dplus1 = 2*two_d;
         int blocks = (N/two_dplus1 + BLOCKSIZE - 1) / BLOCKSIZE;
         //Bulk task launch for the parallel_for
-        for (int region = 0; region < cuConstRendererParams.numRegions; region++) {
+        for (int region = 0; region < numRegions; region++) {
             exclusive_scan_kernel_up<<<blocks, BLOCKSIZE>>>(N/two_dplus1, result+N*region, two_d);
         }
-        cudaDeviceSynchronize();
+        cudaCheckError(cudaDeviceSynchronize());
     }
 
-    int zero_blocks = (cuConstRendererParams.numRegions + BLOCKSIZE - 1) / BLOCKSIZE;
-    set_last_to_zero_kernel<<<zero_blocks, BLOCKSIZE>>>(cuConstRendererParams.numRegions, N, result);
+    int zero_blocks = (numRegions + BLOCKSIZE - 1) / BLOCKSIZE;
+    set_last_to_zero_kernel<<<zero_blocks, BLOCKSIZE>>>(numRegions, N, result);
 
     //downsweep
     for (int two_d = N/2; two_d >= 1; two_d /= 2) {
         int two_dplus1 = 2*two_d;
         int blocks = (N/two_dplus1 + BLOCKSIZE - 1) / BLOCKSIZE;
         //Bulk task launch for the parallel_for
-        for (int region = 0; region < cuConstRendererParams.numRegions; region++) {
+        for (int region = 0; region < numRegions; region++) {
             exclusive_scan_kernel_down<<<blocks, BLOCKSIZE>>>(N/two_dplus1, result+N*region, two_d);
         }
-        cudaDeviceSynchronize();
+        cudaCheckError(cudaDeviceSynchronize());
     }
 
 }
@@ -755,9 +794,10 @@ __global__ void
 populate_indices_kernel(int* binary, int* cumulative, int* result) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= cuConstRendererParams.numRegions*cuConstRendererParams.numCirclesUp) return;
-    int this_circle = index % cuConstRendererParams.numCirclesUp;
+    if (!binary[index]) return;
     int this_region = index / cuConstRendererParams.numCirclesUp;
-    if (binary[index]) result[this_region * cuConstRendererParams.numCirclesUp + cumulative[index+1] - 1] = index;
+    int this_circle = index % cuConstRendererParams.numCirclesUp;
+    result[this_region * cuConstRendererParams.numCirclesUp + cumulative[index+1] - 1] = this_circle;
 }
 
 __global__ void
@@ -775,20 +815,20 @@ render_pixel_kernel(int* regionTable, int* circlesPerRegion) {
     int num_pixels = cuConstRendererParams.imageWidth * cuConstRendererParams.imageHeight;
     if (index >= num_pixels) return;
     int pixel_x = index % cuConstRendererParams.imageWidth;
-    int pixel_y = index / cuConstRendererParams.imageWidth;
-    float pixelWidth = 1.f / imageWidth;
-    float pixelHeight = 1.f / imageHeight;
+    int pixel_y = index / cuConstRendererParams.imageHeight;
+    float pixelWidth = 1.f / cuConstRendererParams.imageWidth;
+    float pixelHeight = 1.f / cuConstRendererParams.imageHeight;
     float regionWidth = 1.f / cuConstRendererParams.numGridCells;
     float regionHeight = 1.f / cuConstRendererParams.numGridCells;
-    float pixelCenter_x = pixelWidth * (static_cast<float>(pixelX) + 0.5f);
-    float pixelCenter_y = pixelHeight * (static_cast<float>(pixelY) + 0.5f);
+    float pixelCenter_x = pixelWidth * (static_cast<float>(pixel_x) + 0.5f);
+    float pixelCenter_y = pixelHeight * (static_cast<float>(pixel_y) + 0.5f);
     float2 pixelCenterNorm = make_float2(pixelCenter_x, pixelCenter_y);
     int region_x = static_cast<int>(pixelCenter_x / regionWidth);
     int region_y = static_cast<int>(pixelCenter_y / regionHeight);
     int region = region_x + region_y * cuConstRendererParams.numGridCells;
 
 
-    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixel_y * imageWidth + pixel_x)]);
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixel_y * cuConstRendererParams.imageWidth + pixel_x)]);
 
     for (int i = 0; i < circlesPerRegion[region]; i++) {
         int index = regionTable[region*cuConstRendererParams.numCirclesUp + i];
@@ -798,34 +838,87 @@ render_pixel_kernel(int* regionTable, int* circlesPerRegion) {
 
 void
 CudaRenderer::render() {
+    int length;
+    int* vals;
     int* cudaDeviceRegionTableBinary = nullptr;
     int* cudaDeviceRegionTableCumulative = nullptr;
     int* cudaDeviceRegionTable = nullptr;
     int* cudaDeviceCirclesPerRegion = nullptr;
-    cudaMalloc(&cudaDeviceRegionTableBinary, sizeof(int) * cuConstRendererParams.numCirclesUp * cuConstRendererParams.numRegions);
-    cudaMalloc(&cudaDeviceRegionTableCumulative, sizeof(int) * cuConstRendererParams.numCirclesUp * cuConstRendererParams.numRegions);
-    cudaMalloc(&cudaDeviceRegionTable, sizeof(int) * cuConstRendererParams.numCirclesUp * cuConstRendererParams.numRegions);
-    cudaMalloc(&cudaDeviceCirclesPerRegion, sizeof(int) * cuConstRendererParams.numRegions);
+    //binary is numRegions x numCircles
+    //cumulative is numRegions x roundup(numCircles+1)
+    //table is numRegions x numCircles
+    //perR is numRegions x 1
+    cudaMalloc(&cudaDeviceRegionTableBinary, sizeof(int) * numCirclesUp * numRegions);
+    cudaMalloc(&cudaDeviceRegionTableCumulative, sizeof(int) * numCirclesUp * numRegions);
+    cudaMalloc(&cudaDeviceRegionTable, sizeof(int) * numCirclesUp * numRegions);
+    cudaMalloc(&cudaDeviceCirclesPerRegion, sizeof(int) * numRegions);
 
     //Now, do a task launch of the kernel over all circles
     dim3 blockDim(256, 1);
-    dim3 gridDim((cuConstRendererParams.numCirclesUp * cuConstRendererParams.numRegions + blockDim.x - 1) / blockDim.x);
+    dim3 gridDim((numCirclesUp * numRegions + blockDim.x - 1) / blockDim.x);
     kernelRecordSpotsOfCircles<<<gridDim, blockDim>>>(cudaDeviceRegionTableBinary);
-    cudaDeviceSynchronize();
+    cudaCheckError(cudaDeviceSynchronize());
+    
+    // length = numCirclesUp * numRegions;
+    // vals = (int*) malloc(length*sizeof(int));
+    // cudaMemcpy(vals, cudaDeviceRegionTableBinary, length*sizeof(int), cudaMemcpyDeviceToHost);
+    // std::cout << "Binary" << std::endl;
+    // for (int i = 0; i < numRegions; i++) {
+    //     for (int j = 0; j < numCirclesUp; j++) {
+    //         std::cout << vals[i*numCirclesUp + j] << " ";
+    //     }
+    //     std::cout << std::endl;
+    // }
+    // std::cout << std::endl;
+    
+    // cudaFree(vals);
+
+    cudaCheckError(cudaDeviceSynchronize());
 
     //Copy the table and run cumsum on it
-    cudaMemcpy(cudaDeviceRegionTableCumulative, cudaDeviceRegionTableBinary, cuConstRendererParams.numCirclesUp * cuConstRendererParams.numRegions, cudaMemcpyDeviceToDevice);
-    exclusive_scan<<<gridDim, blockDim>>>(cudaDeviceRegionTableCumulative);
-    cudaDeviceSynchronize();
+    cudaMemcpy(cudaDeviceRegionTableCumulative, cudaDeviceRegionTableBinary, numCirclesUp * numRegions * sizeof(int), cudaMemcpyDeviceToDevice);
+    exclusive_scan(cudaDeviceRegionTableCumulative, numCirclesUp, numRegions);
+
+    // length = numCirclesUp * numRegions;
+    // vals = (int*) malloc(length*sizeof(int));
+    // cudaMemcpy(vals, cudaDeviceRegionTableCumulative, length*sizeof(int), cudaMemcpyDeviceToHost);
+    // std::cout << "Cumulative" << std::endl;
+    // for (int i = 0; i < numRegions; i++) {
+    //     for (int j = 0; j < numCirclesUp; j++) {
+    //         std::cout << vals[i*numCirclesUp + j] << " ";
+    //     }
+    //     std::cout << std::endl;
+    // }
+    // std::cout << std::endl;
+    
+    // cudaFree(vals);
 
     //Generate condensed regions->circles map
     populate_indices_kernel<<<gridDim, blockDim>>>(cudaDeviceRegionTableBinary, cudaDeviceRegionTableCumulative, cudaDeviceRegionTable);
-    dim3 gridRegionsDim((cuConstRendererParams.numRegions + blockDim.x - 1) / blockDim.x);
+    dim3 gridRegionsDim((numRegions + blockDim.x - 1) / blockDim.x);
     populate_counts_kernel<<<gridRegionsDim, blockDim>>>(cudaDeviceRegionTableCumulative, cudaDeviceCirclesPerRegion);
-    cudaDeviceSynchronize();
+    cudaCheckError(cudaDeviceSynchronize());
+
+    // length = numCirclesUp * numRegions;
+    // vals = (int*) malloc(length*sizeof(int));
+    // cudaMemcpy(vals, cudaDeviceRegionTable, length*sizeof(int), cudaMemcpyDeviceToHost);
+    // std::cout << "Circles in each region" << std::endl;
+    // for (int i = 0; i < numRegions; i++) {
+    //     for (int j = 0; j < numCirclesUp; j++) {
+    //         std::cout << vals[i*numCirclesUp + j] << " ";
+    //     }
+    //     std::cout << std::endl;
+    // }
+    
+    // cudaFree(vals);
 
     //Render everything
-    dim3 pixelsDim((cuConstRendererParams.imageWidth * cuConstRendererParams.imageHeight + blockDim.x - 1) / blockDim.x);
+    dim3 pixelsDim((imageWidth * imageHeight + blockDim.x - 1) / blockDim.x);
     render_pixel_kernel<<<pixelsDim, blockDim>>>(cudaDeviceRegionTable, cudaDeviceCirclesPerRegion);
-    cudaDeviceSynchronize();
+    cudaCheckError(cudaDeviceSynchronize());
+
+    cudaFree(cudaDeviceRegionTableBinary);
+    cudaFree(cudaDeviceRegionTableCumulative);
+    cudaFree(cudaDeviceRegionTable);
+    cudaFree(cudaDeviceCirclesPerRegion);
 }
