@@ -831,6 +831,23 @@ void CudaRenderer::exclusive_scan_v2(int* cudaDeviceRegionTableBinary, int* cuda
 
 }
 
+__global__ void
+populate_indices_kernel(int* binary, int* cumulative, int* result) {
+    //binary says if we observed circle "index" based on [index + index/2023]
+    //This thread should be called on numCircles*numRegions
+
+
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= cuConstRendererParams.numRegions*cuConstRendererParams.numCircles) return;
+    int this_region = index / cuConstRendererParams.numCircles;
+    int this_circle = index % cuConstRendererParams.numCircles;
+    if (!binary[this_region * cuConstRendererParams.numSpacesForCircles + this_circle + this_circle/2023]) return;
+    int cumulative_val = cumulative[this_region * cuConstRendererParams.numSpacesForCircles+this_circle + this_circle/2023+1]
+
+    result[this_region * cuConstRendererParams.numCircles + cumulative_val - 1] = this_circle;
+}
+
+
 // rgb, rgby, rand10k, rand100k, rand1M, biglittle, littlebig, pattern, micro2M,
                     //   bouncingballs, fireworks, hypnosis, snow, snowsingle
 
@@ -918,7 +935,7 @@ void CudaRenderer::mediumRender() {
 
     //Generate condensed regions->circles map
     startTime = CycleTimer::currentSeconds();
-    populate_indices_kernel<<<gridDim, blockDim>>>(cudaDeviceRegionTableBinary, cudaDeviceRegionTableCumulative, cudaDeviceRegionTable);
+    populate_indices_kernel_v2<<<gridDim, blockDim>>>(cudaDeviceRegionTableBinary, cudaDeviceRegionTableCumulative, cudaDeviceRegionTable);
     dim3 gridRegionsDim((numRegions + blockDim.x - 1) / blockDim.x);
     populate_counts_kernel<<<gridRegionsDim, blockDim>>>(cudaDeviceRegionTableCumulative, cudaDeviceCirclesPerRegion);
     cudaCheckError(cudaDeviceSynchronize());
