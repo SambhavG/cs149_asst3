@@ -23,7 +23,7 @@
 #include "util.h"
 
 #define BLOCKSIZE 256
-#define SCAN_BLOCK_DIM   BLOCKSIZE  // needed by sharedMemExclusiveScan implementation
+#define SCAN_BLOCK_DIM 1024  // needed by sharedMemExclusiveScan implementation
 #include "exclusiveScan.cu_inl"
 #include "circleBoxTest.cu_inl"
 
@@ -525,6 +525,8 @@ CudaRenderer::setup() {
     numRegions = numGridCells * numGridCells;
     maxRegionsPerSmall = 5;
     smallSize = (1/(float) numGridCells) * ((float) maxRegionsPerSmall-1)/2.0;
+    numBlocksOfCircles = (numCircles + 1022)/1023;
+    numSpacesForCircles = numBlocksOfCircles * 1024;
 
     imageWidth = image->width;
     imageHeight = image->height;
@@ -553,6 +555,8 @@ CudaRenderer::setup() {
     params.numRegions = numRegions;
     params.maxRegionsPerSmall = maxRegionsPerSmall;
     params.smallSize = smallSize;
+    params.numBlocksOfCircles = numBlocksOfCircles;
+    params.numSpacesForCircles = numSpacesForCircles;
 
     cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
 
@@ -754,20 +758,203 @@ render_pixel_kernel(bool useData, int* regionTable, int* circlesPerRegion) {
     *imgPtr = currentColor;
 }
 
+__global__ void
+kernelRecordSpotsOfCircles_v2(int* regions_to_circles_binary) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= cuConstRendererParams.numSpacesForCircles * cuConstRendererParams.numRegions) return;
+
+    //Threads 0..numCircles-1 correspond with region 0
+    int this_circle = index % cuConstRendererParams.numSpacesForCircles;
+    int this_region = index / cuConstRendererParams.numSpacesForCircles;
+    if (this_circle >= cuConstRendererParams.numCircles) return;
+    
+    //Get pos for this circle
+    float x = cuConstRendererParams.position[this_circle*3];
+    float y = cuConstRendererParams.position[this_circle*3+1];
+    float r = cuConstRendererParams.radius[this_circle];
+
+    //Get bounds for this region
+    int x_units = this_region % cuConstRendererParams.numGridCells;
+    int y_units = this_region / cuConstRendererParams.numGridCells;
+    float cell_size = 1/((float) cuConstRendererParams.numGridCells);
+
+    float x_left = x_units * cell_size;
+    float x_right = (x_units+1) * cell_size;
+    float y_bottom = y_units * cell_size;
+    float y_top = (y_units+1) * cell_size;
+    // int indVal = 1;
+    // if (this_circle == indVal) printf("%f %f %f %f\n", x_left, x_right, y_top, y_bottom);
+    //if (this_circle == indVal) printf("%f %f %f\n", x, y, r);
+
+    //Check if this region contains this circle
+
+    if (!circleInBoxConservative(x, y, r, x_left, x_right, y_top, y_bottom)) return;
+    if (!circleInBox(x, y, r, x_left, x_right, y_top, y_bottom)) return;
+
+    //0..1022 -> 0..1022
+    //1023..2046 -> 1024..2047
+
+    regions_to_circles_binary[index + (index/1023)] = 1;
+}
+
+
+__global__ void
+sharedmemscan_kernel(int* data, int* result) {
+    int linearThreadIndex = threadIdx.y * blockDim.x + threadIdx.x;
+
+    __shared__ uint prefixSumInput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumOutput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumScratch[2 * SCAN_BLOCK_DIM];
+
+    //Copy into input
+    cudaMemcpy(prefixSumInput, data, 1024*sizeof(int), cudaMemcpyDeviceToDevice);
+
+    sharedMemExclusiveScan(linearThreadIndex, prefixSumInput, prefixSumOutput, prefixSumScratch, BLOCKSIZE);
+
+    //Copy into output
+    cudaMemcpy(result, prefixSumOutput, 1024*sizeof(int), cudaMemcpyDeviceToDevice);
+}
+
+
+void CudaRenderer::exclusive_scan_v2(int* cudaDeviceRegionTableBinary, int* cudaDeviceRegionTableCumulative) {
+    double startTime = CycleTimer::currentSeconds();
+    //Use sharedmem to run exclusive scan on each 1024 elem subarray of result
+    for (int region = 0; region < numRegions; region++) {
+        for (int block = 0; block < numBlocksOfCircles; block++) {
+            sharedmemscan_kernel<<<1, SCAN_BLOCK_DIM>>>(cudaDeviceRegionTableBinary + region*numSpacesForCircles + block*1024, cudaDeviceRegionTableCumulative + region*numSpacesForCircles + block*1024);
+        }
+    }
+
+    cudaCheckError(cudaDeviceSynchronize());
+    double endTime = CycleTimer::currentSeconds();
+    printf("Scan: %.3f ms\n", 1000.f * (endTime-startTime));
+
+}
+
 // rgb, rgby, rand10k, rand100k, rand1M, biglittle, littlebig, pattern, micro2M,
                     //   bouncingballs, fireworks, hypnosis, snow, snowsingle
 
-void
-CudaRenderer::render() {
+void CudaRenderer::tinyRender() {
+    dim3 blockDim(256, 1);
+    dim3 pixelsDim((imageWidth * imageHeight + blockDim.x - 1) / blockDim.x);
+    render_pixel_kernel<<<pixelsDim, blockDim>>>(false, nullptr, nullptr);
+    cudaCheckError(cudaDeviceSynchronize());
+}
 
-    if (numCircles <= 2000) {
-        dim3 blockDim(256, 1);
-        dim3 pixelsDim((imageWidth * imageHeight + blockDim.x - 1) / blockDim.x);
-        render_pixel_kernel<<<pixelsDim, blockDim>>>(false, nullptr, nullptr);
-        cudaCheckError(cudaDeviceSynchronize());
-        return;
-    }
+void CudaRenderer::mediumRender() {
+    //Similar to largeRender
+    //Instead of scanning the entire array at once, we will exclusiveScan it 1023 at a time
+    //to get chunks of circles to render in each region
+    //Each region will iterate through chunks and circles
 
+    double startTime = CycleTimer::currentSeconds();
+
+    int length;
+    int* vals;
+    int* cudaDeviceRegionTableBinary = nullptr;
+    int* cudaDeviceRegionTableCumulative = nullptr;
+    int* cudaDeviceRegionTable = nullptr;
+    int* cudaDeviceCirclesPerRegion = nullptr;
+    
+    // We need 1024 elements for every 1023 circles
+    // int numBlocksOfCircles = (numCircles + 1022)/1023;
+    // int numSpacesForCircles = numBlocksOfCircles * 1024;
+
+    cudaMalloc(&cudaDeviceRegionTableBinary, sizeof(int) * numSpacesForCircles * numRegions);
+    cudaMalloc(&cudaDeviceRegionTableCumulative, sizeof(int) * numSpacesForCircles * numRegions);
+    cudaMalloc(&cudaDeviceRegionTable, sizeof(int) * numCirclesUp * numRegions);
+    cudaMalloc(&cudaDeviceCirclesPerRegion, sizeof(int) * numBlocksOfCircles * numRegions);
+
+    double endTime = CycleTimer::currentSeconds();
+    printf("Alloc arrays: %.3f ms\n", 1000.f * (endTime-startTime));
+
+
+    startTime = CycleTimer::currentSeconds();
+    //Now, do a task launch of the kernel over all circles
+    dim3 blockDim(BLOCKSIZE, 1);
+    dim3 gridDim((numSpacesForCircles * numRegions + blockDim.x - 1) / blockDim.x);
+    kernelRecordSpotsOfCircles_v2<<<gridDim, blockDim>>>(cudaDeviceRegionTableBinary);
+    cudaCheckError(cudaDeviceSynchronize());
+    endTime = CycleTimer::currentSeconds();
+    printf("Record spots: %.3f ms\n", 1000.f * (endTime-startTime));
+
+    // length = numCirclesUp * numRegions;
+    // vals = (int*) malloc(length*sizeof(int));
+    // cudaMemcpy(vals, cudaDeviceRegionTableBinary, length*sizeof(int), cudaMemcpyDeviceToHost);
+    // std::cout << "Binary" << std::endl;
+    // for (int i = 0; i < numRegions; i++) {
+    //     for (int j = 0; j < numCirclesUp; j++) {
+    //         std::cout << vals[i*numCirclesUp + j] << " ";
+    //     }
+    //     std::cout << std::endl;
+    // }
+    // std::cout << std::endl;
+    // cudaFree(vals);
+    // cudaCheckError(cudaDeviceSynchronize());
+
+    //Copy the table and run cumsum on it
+    startTime = CycleTimer::currentSeconds();
+    cudaMemcpy(cudaDeviceRegionTableCumulative, cudaDeviceRegionTableBinary, numSpacesForCircles * numRegions * sizeof(int), cudaMemcpyDeviceToDevice);
+    endTime = CycleTimer::currentSeconds();
+    printf("Copy table: %.3f ms\n", 1000.f * (endTime-startTime));
+    
+    startTime = CycleTimer::currentSeconds();
+    exclusive_scan_v2(cudaDeviceRegionTableBinary, cudaDeviceRegionTableCumulative);
+    endTime = CycleTimer::currentSeconds();
+    printf("Exclusive scan: %.3f ms\n", 1000.f * (endTime-startTime));
+
+    // length = numCirclesUp * numRegions;
+    // vals = (int*) malloc(length*sizeof(int));
+    // cudaMemcpy(vals, cudaDeviceRegionTableCumulative, length*sizeof(int), cudaMemcpyDeviceToHost);
+    // std::cout << "Cumulative" << std::endl;
+    // for (int i = 0; i < numRegions; i++) {
+    //     for (int j = 0; j < numCirclesUp; j++) {
+    //         std::cout << vals[i*numCirclesUp + j] << " ";
+    //     }
+    //     std::cout << std::endl;
+    // }
+    // std::cout << std::endl;
+    // cudaFree(vals);
+
+    //Generate condensed regions->circles map
+    startTime = CycleTimer::currentSeconds();
+    populate_indices_kernel<<<gridDim, blockDim>>>(cudaDeviceRegionTableBinary, cudaDeviceRegionTableCumulative, cudaDeviceRegionTable);
+    dim3 gridRegionsDim((numRegions + blockDim.x - 1) / blockDim.x);
+    populate_counts_kernel<<<gridRegionsDim, blockDim>>>(cudaDeviceRegionTableCumulative, cudaDeviceCirclesPerRegion);
+    cudaCheckError(cudaDeviceSynchronize());
+    endTime = CycleTimer::currentSeconds();
+    printf("Populate indices: %.3f ms\n", 1000.f * (endTime-startTime));
+
+    // length = numCirclesUp * numRegions;
+    // vals = (int*) malloc(length*sizeof(int));
+    // cudaMemcpy(vals, cudaDeviceRegionTable, length*sizeof(int), cudaMemcpyDeviceToHost);
+    // std::cout << "Circles in each region" << std::endl;
+    // for (int i = 0; i < numRegions; i++) {
+    //     for (int j = 0; j < numCirclesUp; j++) {
+    //         std::cout << vals[i*numCirclesUp + j] << " ";
+    //     }
+    //     std::cout << std::endl;
+    // }
+    // cudaFree(vals);
+
+    //Render everything
+    startTime = CycleTimer::currentSeconds();
+    dim3 pixelsDim((imageWidth * imageHeight + blockDim.x - 1) / blockDim.x);
+    render_pixel_kernel<<<pixelsDim, blockDim>>>(true, cudaDeviceRegionTable, cudaDeviceCirclesPerRegion);
+    cudaCheckError(cudaDeviceSynchronize());
+    endTime = CycleTimer::currentSeconds();
+    printf("Rendering pixels: %.3f ms\n", 1000.f * (endTime-startTime));
+
+    cudaFree(cudaDeviceRegionTableBinary);
+    cudaFree(cudaDeviceRegionTableCumulative);
+    cudaFree(cudaDeviceRegionTable);
+    cudaFree(cudaDeviceCirclesPerRegion);
+
+
+
+}
+
+void CudaRenderer::largeRender() {
     double startTime = CycleTimer::currentSeconds();
 
     int length;
@@ -809,9 +996,7 @@ CudaRenderer::render() {
     //     std::cout << std::endl;
     // }
     // std::cout << std::endl;
-    
     // cudaFree(vals);
-
     // cudaCheckError(cudaDeviceSynchronize());
 
     //Copy the table and run cumsum on it
@@ -836,7 +1021,6 @@ CudaRenderer::render() {
     //     std::cout << std::endl;
     // }
     // std::cout << std::endl;
-    
     // cudaFree(vals);
 
     //Generate condensed regions->circles map
@@ -858,7 +1042,6 @@ CudaRenderer::render() {
     //     }
     //     std::cout << std::endl;
     // }
-    
     // cudaFree(vals);
 
     //Render everything
@@ -873,4 +1056,14 @@ CudaRenderer::render() {
     cudaFree(cudaDeviceRegionTableCumulative);
     cudaFree(cudaDeviceRegionTable);
     cudaFree(cudaDeviceCirclesPerRegion);
+}
+
+
+void
+CudaRenderer::render() {
+
+    if (numCircles <= 500) tinyRender();
+    else if (numCircles <= 20000) mediumRender();
+    else largeRender();
+    
 }

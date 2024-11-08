@@ -26,6 +26,8 @@ private:
     int numRegions;
     int maxRegionsPerSmall;
     float smallSize;
+    int numBlocksOfCircles;
+    int numSpacesForCircles;
 
     int imageWidth;
     int imageHeight;
@@ -52,6 +54,14 @@ public:
     void clearImage();
 
     void advanceAnimation();
+
+    void exclusive_scan_v2();
+
+    void tinyRender();
+
+    void mediumRender();
+
+    void largeRender();
 
     void render();
 
